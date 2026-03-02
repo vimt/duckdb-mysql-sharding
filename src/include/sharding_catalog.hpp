@@ -15,8 +15,6 @@ public:
 	~ShardingCatalog();
 
 	ShardingConfig config;
-	// {logic_db -> {logic_table -> LogicTableInfo}}
-	unordered_map<string, unordered_map<string, LogicTableInfo>> schema_map;
 
 public:
 	void Initialize(bool load_builtin) override;
@@ -44,24 +42,32 @@ public:
 	bool InMemory() override;
 	string GetDBPath() override;
 
+	//! Discover schemas from MySQL and write to cache DB
 	void DiscoverSchemas();
+	//! Load columns for a schema from MySQL into cache DB (lazy, skips if already present)
 	void LoadColumnsForSchema(const string &schema_name);
 
-	bool LoadCache();
-	void SaveCache();
-
-	//! Full refresh: clear everything, re-discover schemas from MySQL, save cache
+	//! Full refresh: clear everything, re-discover from MySQL
 	void ClearCacheAndRefresh();
-	//! Refresh columns for a specific schema: re-load from MySQL, update cache
+	//! Refresh columns for a specific schema
 	void RefreshSchema(const string &schema_name);
 
-	const LogicTableInfo *GetLogicTable(const string &schema, const string &table) const;
+	//! Read helpers: query cache DB
+	vector<string> GetSchemaNames();
+	vector<string> GetTableNames(const string &schema_name);
+	LogicTableInfo GetLogicTable(const string &schema_name, const string &table_name);
+	bool HasColumnsForSchema(const string &schema_name);
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
+	void InitCacheDB();
+
 	unordered_map<string, unique_ptr<ShardingSchemaEntry>> schema_entries;
 	mutex schema_lock;
+
+	unique_ptr<DuckDB> cache_db;
+	unique_ptr<Connection> cache_conn;
 	mutex cache_lock;
 	string attach_path;
 	string cache_path;

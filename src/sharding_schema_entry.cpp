@@ -25,29 +25,17 @@ void ShardingSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 	}
 
 	auto &sharding_catalog = catalog.Cast<ShardingCatalog>();
-	auto schema_it = sharding_catalog.schema_map.find(name);
-	if (schema_it == sharding_catalog.schema_map.end()) {
-		tables_loaded = true;
-		return;
-	}
 
-	// Lazy load: if any table in this schema is missing columns, batch-load from MySQL
-	bool need_loading = false;
-	for (auto &table_pair : schema_it->second) {
-		if (table_pair.second.columns.empty() && !table_pair.second.physical_tables.empty()) {
-			need_loading = true;
-			break;
-		}
-	}
-	if (need_loading) {
+	// Lazy load columns from MySQL if not yet in cache DB
+	if (!sharding_catalog.HasColumnsForSchema(name)) {
 		sharding_catalog.LoadColumnsForSchema(name);
 	}
 
 	MySQLTypeConfig type_config(context);
 
-	for (auto &table_pair : schema_it->second) {
-		auto &table_name = table_pair.first;
-		auto &logic_table = table_pair.second;
+	auto table_names = sharding_catalog.GetTableNames(name);
+	for (auto &table_name : table_names) {
+		auto logic_table = sharding_catalog.GetLogicTable(name, table_name);
 
 		if (logic_table.columns.empty()) {
 			continue;
@@ -73,7 +61,7 @@ void ShardingSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 		}
 
 		if (create_info->columns.LogicalColumnCount() > 0) {
-			auto entry = make_uniq<ShardingTableEntry>(catalog, *this, *create_info, logic_table);
+			auto entry = make_uniq<ShardingTableEntry>(catalog, *this, *create_info, std::move(logic_table));
 			tables[table_name] = std::move(entry);
 		}
 	}

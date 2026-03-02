@@ -12,7 +12,6 @@
 #include "duckdb/main/appender.hpp"
 
 #include <chrono>
-#include <cstdio>
 
 namespace duckdb {
 
@@ -21,34 +20,112 @@ static int64_t CurrentEpochSeconds() {
 	return std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
 }
 
+static string EscapeSql(const string &s) {
+	string result;
+	for (auto c : s) {
+		if (c == '\'') {
+			result += "''";
+		} else {
+			result += c;
+		}
+	}
+	return result;
+}
+
+// ---------------------------------------------------------------------------
+// Constructor / Init
+// ---------------------------------------------------------------------------
+
 ShardingCatalog::ShardingCatalog(AttachedDatabase &db_p, ShardingConfig config_p, const string &config_path_p,
                                  const string &cache_path_p, int64_t cache_ttl_p)
     : Catalog(db_p), config(std::move(config_p)), attach_path(config_path_p), cache_path(cache_path_p),
       cache_ttl(cache_ttl_p) {
 
-	if (!cache_path.empty() && LoadCache()) {
-		return;
+	InitCacheDB();
+
+	// Check if cache DB already has data
+	auto count_result = cache_conn->Query("SELECT COUNT(*) FROM physical_tables");
+	int64_t pt_count = 0;
+	if (!count_result->HasError()) {
+		auto chunk = count_result->Fetch();
+		if (chunk && chunk->size() > 0) {
+			pt_count = chunk->GetValue(0, 0).GetValue<int64_t>();
+		}
+	}
+
+	if (pt_count > 0) {
+		// Check TTL
+		bool expired = false;
+		if (cache_ttl > 0) {
+			auto meta_result =
+			    cache_conn->Query("SELECT value FROM cache_meta WHERE key = 'schemas_updated_at'");
+			if (!meta_result->HasError()) {
+				auto chunk = meta_result->Fetch();
+				if (chunk && chunk->size() > 0) {
+					int64_t updated = std::stoll(chunk->GetValue(0, 0).GetValue<string>());
+					int64_t age = CurrentEpochSeconds() - updated;
+					if (age > cache_ttl) {
+						Printer::Print(StringUtil::Format(
+						    "[mysql_sharding] Cache expired (age=%ds, ttl=%ds), will re-discover", age,
+						    cache_ttl));
+						expired = true;
+					}
+				}
+			}
+		}
+
+		if (!expired) {
+			Printer::Print(
+			    StringUtil::Format("[mysql_sharding] Using cached schema (%d physical tables)", pt_count));
+			return;
+		}
 	}
 
 	DiscoverSchemas();
-
-	if (!cache_path.empty()) {
-		SaveCache();
-	}
 }
 
-ShardingCatalog::~ShardingCatalog() = default;
+ShardingCatalog::~ShardingCatalog() {
+	cache_conn.reset();
+	cache_db.reset();
+}
 
 void ShardingCatalog::Initialize(bool load_builtin) {
 }
 
+void ShardingCatalog::InitCacheDB() {
+	if (cache_path.empty()) {
+		cache_db = make_uniq<DuckDB>(nullptr);
+	} else {
+		cache_db = make_uniq<DuckDB>(cache_path);
+	}
+	cache_conn = make_uniq<Connection>(*cache_db->instance);
+
+	cache_conn->Query("CREATE TABLE IF NOT EXISTS cache_meta (key VARCHAR PRIMARY KEY, value VARCHAR)");
+
+	cache_conn->Query("CREATE TABLE IF NOT EXISTS physical_tables ("
+	                  "logic_db VARCHAR NOT NULL, logic_table VARCHAR NOT NULL, "
+	                  "host VARCHAR NOT NULL, db_name VARCHAR NOT NULL, table_name VARCHAR NOT NULL, "
+	                  "rows_count BIGINT DEFAULT 0, db_index INTEGER DEFAULT -1, table_index INTEGER DEFAULT -1)");
+
+	cache_conn->Query("CREATE TABLE IF NOT EXISTS table_columns ("
+	                  "logic_db VARCHAR NOT NULL, logic_table VARCHAR NOT NULL, "
+	                  "col_name VARCHAR NOT NULL, type_name VARCHAR NOT NULL, column_type VARCHAR NOT NULL, "
+	                  "is_nullable BOOLEAN DEFAULT false, col_precision BIGINT DEFAULT -1, "
+	                  "col_scale BIGINT DEFAULT -1)");
+}
+
 // ---------------------------------------------------------------------------
-// Schema discovery
+// Schema discovery: MySQL → cache DB
 // ---------------------------------------------------------------------------
 
 void ShardingCatalog::DiscoverSchemas() {
+	lock_guard<mutex> l(cache_lock);
 	auto t0 = std::chrono::steady_clock::now();
 	Printer::Print("[mysql_sharding] Starting schema discovery...");
+
+	cache_conn->Query("DELETE FROM physical_tables");
+
+	idx_t total_physical = 0;
 
 	for (auto &host_conn_str : config.host_list) {
 		try {
@@ -67,56 +144,76 @@ void ShardingCatalog::DiscoverSchemas() {
 
 			auto result = conn.Query(query, MySQLResultStreaming::FORCE_MATERIALIZATION);
 
-			idx_t table_count = 0;
-			while (result->Next()) {
-				string db_name = result->GetString(0);
-				string table_name = result->GetString(1);
-				int64_t rows_count = result->IsNull(2) ? 0 : result->GetInt64(2);
+			idx_t host_count = 0;
+			{
+				Appender appender(*cache_conn, "physical_tables");
+				while (result->Next()) {
+					string db_name = result->GetString(0);
+					string table_name = result->GetString(1);
+					int64_t rows_count = result->IsNull(2) ? 0 : result->GetInt64(2);
 
-				auto db_split = SplitSharding(db_name);
-				auto tbl_split = SplitSharding(table_name);
+					auto db_split = SplitSharding(db_name);
+					auto tbl_split = SplitSharding(table_name);
 
-				PhysicalTableInfo physical;
-				physical.host = host_conn_str;
-				physical.db_name = db_name;
-				physical.table_name = table_name;
-				physical.rows_count = rows_count;
-				physical.db_index = db_split.second;
-				physical.table_index = tbl_split.second;
-
-				auto &logic_info = schema_map[db_split.first][tbl_split.first];
-				logic_info.logic_db = db_split.first;
-				logic_info.logic_table = tbl_split.first;
-				logic_info.physical_tables.push_back(std::move(physical));
-				table_count++;
+					appender.BeginRow();
+					appender.Append(Value(db_split.first));
+					appender.Append(Value(tbl_split.first));
+					appender.Append(Value(host_conn_str));
+					appender.Append(Value(db_name));
+					appender.Append(Value(table_name));
+					appender.Append(Value::BIGINT(rows_count));
+					appender.Append(Value::INTEGER(db_split.second));
+					appender.Append(Value::INTEGER(tbl_split.second));
+					appender.EndRow();
+					host_count++;
+				}
+				appender.Close();
 			}
 
+			total_physical += host_count;
 			Printer::Print(StringUtil::Format("[mysql_sharding] Host '%s': discovered %d physical tables",
-			                                  params.host, table_count));
+			                                  params.host, host_count));
 		} catch (std::exception &e) {
 			Printer::Print(
 			    StringUtil::Format("[mysql_sharding] Warning: failed to connect to host: %s", e.what()));
 		}
 	}
 
-	idx_t total_logical = 0;
-	for (auto &s : schema_map) {
-		total_logical += s.second.size();
-	}
+	// Update timestamp
+	cache_conn->Query("DELETE FROM cache_meta WHERE key = 'schemas_updated_at'");
+	cache_conn->Query("INSERT INTO cache_meta VALUES ('schemas_updated_at', '" +
+	                  to_string(CurrentEpochSeconds()) + "')");
+
+	auto schema_names = GetSchemaNames();
 	auto elapsed =
 	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 	Printer::Print(StringUtil::Format(
-	    "[mysql_sharding] Schema discovery complete: %d schemas, %d logical tables (%.1fs)",
-	    schema_map.size(), total_logical, elapsed / 1000.0));
+	    "[mysql_sharding] Schema discovery complete: %d schemas, %d physical tables (%.1fs)",
+	    schema_names.size(), total_physical, elapsed / 1000.0));
 }
 
 // ---------------------------------------------------------------------------
-// Lazy column loading per schema
+// Lazy column loading: MySQL → cache DB
 // ---------------------------------------------------------------------------
 
 void ShardingCatalog::LoadColumnsForSchema(const string &schema_name) {
-	auto schema_it = schema_map.find(schema_name);
-	if (schema_it == schema_map.end()) {
+	lock_guard<mutex> l(cache_lock);
+
+	if (HasColumnsForSchema(schema_name)) {
+		return;
+	}
+
+	// Get representative physical table for each logical table (first one)
+	auto rep_result = cache_conn->Query(
+	    "SELECT logic_table, host, db_name, table_name FROM ("
+	    "  SELECT logic_table, host, db_name, table_name, "
+	    "    ROW_NUMBER() OVER (PARTITION BY logic_table ORDER BY db_index, table_index) AS rn "
+	    "  FROM physical_tables WHERE logic_db = '" +
+	    EscapeSql(schema_name) +
+	    "'"
+	    ") WHERE rn = 1");
+
+	if (rep_result->HasError()) {
 		return;
 	}
 
@@ -127,13 +224,19 @@ void ShardingCatalog::LoadColumnsForSchema(const string &schema_name) {
 	};
 	unordered_map<string, vector<RepInfo>> host_reps;
 
-	for (auto &tp : schema_it->second) {
-		auto &logic = tp.second;
-		if (!logic.columns.empty() || logic.physical_tables.empty()) {
-			continue;
+	while (true) {
+		auto chunk = rep_result->Fetch();
+		if (!chunk || chunk->size() == 0) {
+			break;
 		}
-		auto &rep = logic.physical_tables[0];
-		host_reps[rep.host].push_back({logic.logic_table, rep.db_name, rep.table_name});
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			RepInfo ri;
+			ri.logic_table = chunk->GetValue(0, r).GetValue<string>();
+			string host = chunk->GetValue(1, r).GetValue<string>();
+			ri.phys_db = chunk->GetValue(2, r).GetValue<string>();
+			ri.phys_table = chunk->GetValue(3, r).GetValue<string>();
+			host_reps[host].push_back(std::move(ri));
+		}
 	}
 
 	if (host_reps.empty()) {
@@ -159,9 +262,10 @@ void ShardingCatalog::LoadColumnsForSchema(const string &schema_name) {
 					if (i > bs) {
 						where_clause += " OR ";
 					}
-					where_clause += "(TABLE_SCHEMA = " + MySQLUtils::WriteLiteral(hp.second[i].phys_db) +
-					                " AND TABLE_NAME = " + MySQLUtils::WriteLiteral(hp.second[i].phys_table) +
-					                ")";
+					where_clause += "(TABLE_SCHEMA = " +
+					                MySQLUtils::WriteLiteral(hp.second[i].phys_db) +
+					                " AND TABLE_NAME = " +
+					                MySQLUtils::WriteLiteral(hp.second[i].phys_table) + ")";
 					phys_to_logic[hp.second[i].phys_db + "\t" + hp.second[i].phys_table] =
 					    hp.second[i].logic_table;
 				}
@@ -174,6 +278,7 @@ void ShardingCatalog::LoadColumnsForSchema(const string &schema_name) {
 
 				auto result = conn.Query(query, MySQLResultStreaming::FORCE_MATERIALIZATION);
 
+				Appender appender(*cache_conn, "table_columns");
 				while (result->Next()) {
 					string phys_key = result->GetString(0) + "\t" + result->GetString(1);
 					auto it = phys_to_logic.find(phys_key);
@@ -181,15 +286,18 @@ void ShardingCatalog::LoadColumnsForSchema(const string &schema_name) {
 						continue;
 					}
 
-					ColumnInfo col;
-					col.name = result->GetString(2);
-					col.type_name = result->GetString(3);
-					col.column_type = result->GetString(4);
-					col.is_nullable = result->GetString(5) == "YES";
-					col.precision = result->IsNull(6) ? -1 : result->GetInt64(6);
-					col.scale = result->IsNull(7) ? -1 : result->GetInt64(7);
-					schema_map[schema_name][it->second].columns.push_back(std::move(col));
+					appender.BeginRow();
+					appender.Append(Value(schema_name));
+					appender.Append(Value(it->second));
+					appender.Append(Value(result->GetString(2)));
+					appender.Append(Value(result->GetString(3)));
+					appender.Append(Value(result->GetString(4)));
+					appender.Append(Value::BOOLEAN(result->GetString(5) == "YES"));
+					appender.Append(Value::BIGINT(result->IsNull(6) ? -1 : result->GetInt64(6)));
+					appender.Append(Value::BIGINT(result->IsNull(7) ? -1 : result->GetInt64(7)));
+					appender.EndRow();
 				}
+				appender.Close();
 				tables_loaded += (be - bs);
 			}
 		} catch (std::exception &e) {
@@ -202,10 +310,118 @@ void ShardingCatalog::LoadColumnsForSchema(const string &schema_name) {
 	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 	Printer::Print(StringUtil::Format("[mysql_sharding] Schema '%s': loaded columns for %d tables (%.1fs)",
 	                                  schema_name, tables_loaded, elapsed / 1000.0));
+}
 
-	if (!cache_path.empty()) {
-		SaveCache();
+// ---------------------------------------------------------------------------
+// Read helpers: query cache DB
+// ---------------------------------------------------------------------------
+
+vector<string> ShardingCatalog::GetSchemaNames() {
+	vector<string> names;
+	auto result = cache_conn->Query("SELECT DISTINCT logic_db FROM physical_tables ORDER BY logic_db");
+	if (result->HasError()) {
+		return names;
 	}
+	while (true) {
+		auto chunk = result->Fetch();
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			names.push_back(chunk->GetValue(0, r).GetValue<string>());
+		}
+	}
+	return names;
+}
+
+vector<string> ShardingCatalog::GetTableNames(const string &schema_name) {
+	vector<string> names;
+	auto result = cache_conn->Query("SELECT DISTINCT logic_table FROM physical_tables WHERE logic_db = '" +
+	                                EscapeSql(schema_name) + "' ORDER BY logic_table");
+	if (result->HasError()) {
+		return names;
+	}
+	while (true) {
+		auto chunk = result->Fetch();
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			names.push_back(chunk->GetValue(0, r).GetValue<string>());
+		}
+	}
+	return names;
+}
+
+LogicTableInfo ShardingCatalog::GetLogicTable(const string &schema_name, const string &table_name) {
+	LogicTableInfo info;
+	info.logic_db = schema_name;
+	info.logic_table = table_name;
+
+	// Physical tables
+	auto pt_result = cache_conn->Query(
+	    "SELECT host, db_name, table_name, rows_count, db_index, table_index "
+	    "FROM physical_tables WHERE logic_db = '" +
+	    EscapeSql(schema_name) + "' AND logic_table = '" + EscapeSql(table_name) + "'");
+
+	if (!pt_result->HasError()) {
+		while (true) {
+			auto chunk = pt_result->Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			for (idx_t r = 0; r < chunk->size(); r++) {
+				PhysicalTableInfo pt;
+				pt.host = chunk->GetValue(0, r).GetValue<string>();
+				pt.db_name = chunk->GetValue(1, r).GetValue<string>();
+				pt.table_name = chunk->GetValue(2, r).GetValue<string>();
+				pt.rows_count = chunk->GetValue(3, r).GetValue<int64_t>();
+				pt.db_index = chunk->GetValue(4, r).GetValue<int32_t>();
+				pt.table_index = chunk->GetValue(5, r).GetValue<int32_t>();
+				info.physical_tables.push_back(std::move(pt));
+			}
+		}
+	}
+
+	// Columns
+	auto col_result = cache_conn->Query(
+	    "SELECT col_name, type_name, column_type, is_nullable, col_precision, col_scale "
+	    "FROM table_columns WHERE logic_db = '" +
+	    EscapeSql(schema_name) + "' AND logic_table = '" + EscapeSql(table_name) + "'");
+
+	if (!col_result->HasError()) {
+		while (true) {
+			auto chunk = col_result->Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			for (idx_t r = 0; r < chunk->size(); r++) {
+				ColumnInfo col;
+				col.name = chunk->GetValue(0, r).GetValue<string>();
+				col.type_name = chunk->GetValue(1, r).GetValue<string>();
+				col.column_type = chunk->GetValue(2, r).GetValue<string>();
+				col.is_nullable = chunk->GetValue(3, r).GetValue<bool>();
+				col.precision = chunk->GetValue(4, r).GetValue<int64_t>();
+				col.scale = chunk->GetValue(5, r).GetValue<int64_t>();
+				info.columns.push_back(std::move(col));
+			}
+		}
+	}
+
+	return info;
+}
+
+bool ShardingCatalog::HasColumnsForSchema(const string &schema_name) {
+	auto result = cache_conn->Query("SELECT COUNT(*) FROM table_columns WHERE logic_db = '" +
+	                                EscapeSql(schema_name) + "'");
+	if (result->HasError()) {
+		return false;
+	}
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		return false;
+	}
+	return chunk->GetValue(0, 0).GetValue<int64_t>() > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -217,14 +433,14 @@ void ShardingCatalog::ClearCacheAndRefresh() {
 		lock_guard<mutex> l(schema_lock);
 		schema_entries.clear();
 	}
-	schema_map.clear();
 
-	DiscoverSchemas();
-
-	if (!cache_path.empty()) {
-		SaveCache();
+	{
+		lock_guard<mutex> l(cache_lock);
+		cache_conn->Query("DELETE FROM physical_tables");
+		cache_conn->Query("DELETE FROM table_columns");
 	}
 
+	DiscoverSchemas();
 	Printer::Print("[mysql_sharding] Full refresh complete");
 }
 
@@ -234,13 +450,9 @@ void ShardingCatalog::RefreshSchema(const string &schema_name) {
 		schema_entries.erase(schema_name);
 	}
 
-	auto it = schema_map.find(schema_name);
-	if (it == schema_map.end()) {
-		Printer::Print(StringUtil::Format("[mysql_sharding] Schema '%s' not found", schema_name));
-		return;
-	}
-	for (auto &tp : it->second) {
-		tp.second.columns.clear();
+	{
+		lock_guard<mutex> l(cache_lock);
+		cache_conn->Query("DELETE FROM table_columns WHERE logic_db = '" + EscapeSql(schema_name) + "'");
 	}
 
 	LoadColumnsForSchema(schema_name);
@@ -248,198 +460,8 @@ void ShardingCatalog::RefreshSchema(const string &schema_name) {
 }
 
 // ---------------------------------------------------------------------------
-// Cache: DuckDB database file
-// ---------------------------------------------------------------------------
-
-void ShardingCatalog::SaveCache() {
-	lock_guard<mutex> l(cache_lock);
-	auto t0 = std::chrono::steady_clock::now();
-	try {
-		std::remove(cache_path.c_str());
-		std::remove((cache_path + ".wal").c_str());
-
-		DuckDB cache_db(cache_path);
-		Connection conn(*cache_db.instance);
-
-		conn.Query("CREATE TABLE cache_meta (key VARCHAR, value VARCHAR)");
-		conn.Query("INSERT INTO cache_meta VALUES ('created_at', '" + to_string(CurrentEpochSeconds()) + "')");
-
-		conn.Query("CREATE TABLE physical_tables ("
-		           "logic_db VARCHAR, logic_table VARCHAR, "
-		           "host VARCHAR, db_name VARCHAR, table_name VARCHAR, "
-		           "rows_count BIGINT, db_index INTEGER, table_index INTEGER)");
-
-		conn.Query("CREATE TABLE table_columns ("
-		           "logic_db VARCHAR, logic_table VARCHAR, "
-		           "col_name VARCHAR, type_name VARCHAR, column_type VARCHAR, "
-		           "is_nullable BOOLEAN, col_precision BIGINT, col_scale BIGINT)");
-
-		{
-			Appender appender(conn, "physical_tables");
-			for (auto &sp : schema_map) {
-				for (auto &tp : sp.second) {
-					for (auto &pt : tp.second.physical_tables) {
-						appender.BeginRow();
-						appender.Append(Value(tp.second.logic_db));
-						appender.Append(Value(tp.second.logic_table));
-						appender.Append(Value(pt.host));
-						appender.Append(Value(pt.db_name));
-						appender.Append(Value(pt.table_name));
-						appender.Append(Value::BIGINT(pt.rows_count));
-						appender.Append(Value::INTEGER(pt.db_index));
-						appender.Append(Value::INTEGER(pt.table_index));
-						appender.EndRow();
-					}
-				}
-			}
-			appender.Close();
-		}
-
-		{
-			Appender appender(conn, "table_columns");
-			for (auto &sp : schema_map) {
-				for (auto &tp : sp.second) {
-					for (auto &col : tp.second.columns) {
-						appender.BeginRow();
-						appender.Append(Value(tp.second.logic_db));
-						appender.Append(Value(tp.second.logic_table));
-						appender.Append(Value(col.name));
-						appender.Append(Value(col.type_name));
-						appender.Append(Value(col.column_type));
-						appender.Append(Value::BOOLEAN(col.is_nullable));
-						appender.Append(Value::BIGINT(col.precision));
-						appender.Append(Value::BIGINT(col.scale));
-						appender.EndRow();
-					}
-				}
-			}
-			appender.Close();
-		}
-
-		auto elapsed =
-		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-		Printer::Print(StringUtil::Format("[mysql_sharding] Cache saved to %s (%.1fs)", cache_path,
-		                                  elapsed / 1000.0));
-	} catch (std::exception &e) {
-		Printer::Print(StringUtil::Format("[mysql_sharding] Warning: failed to save cache: %s", e.what()));
-	}
-}
-
-bool ShardingCatalog::LoadCache() {
-	auto t0 = std::chrono::steady_clock::now();
-	try {
-		DBConfig cache_config;
-		cache_config.options.access_mode = AccessMode::READ_ONLY;
-		DuckDB cache_db(cache_path, &cache_config);
-		Connection conn(*cache_db.instance);
-
-		// Check TTL
-		if (cache_ttl > 0) {
-			auto meta_result = conn.Query("SELECT value FROM cache_meta WHERE key = 'created_at'");
-			if (!meta_result->HasError()) {
-				auto chunk = meta_result->Fetch();
-				if (chunk && chunk->size() > 0) {
-					int64_t created = std::stoll(chunk->GetValue(0, 0).GetValue<string>());
-					int64_t age = CurrentEpochSeconds() - created;
-					if (age > cache_ttl) {
-						Printer::Print(StringUtil::Format(
-						    "[mysql_sharding] Cache expired (age=%ds, ttl=%ds), will re-discover", age,
-						    cache_ttl));
-						return false;
-					}
-				}
-			}
-		}
-
-		schema_map.clear();
-		idx_t pt_count = 0;
-		idx_t col_count = 0;
-
-		auto pt_result = conn.Query("SELECT logic_db, logic_table, host, db_name, table_name, "
-		                            "rows_count, db_index, table_index FROM physical_tables");
-		if (pt_result->HasError()) {
-			return false;
-		}
-		while (true) {
-			auto chunk = pt_result->Fetch();
-			if (!chunk || chunk->size() == 0) {
-				break;
-			}
-			for (idx_t r = 0; r < chunk->size(); r++) {
-				string logic_db = chunk->GetValue(0, r).GetValue<string>();
-				string logic_table = chunk->GetValue(1, r).GetValue<string>();
-
-				auto &info = schema_map[logic_db][logic_table];
-				info.logic_db = logic_db;
-				info.logic_table = logic_table;
-
-				PhysicalTableInfo pt;
-				pt.host = chunk->GetValue(2, r).GetValue<string>();
-				pt.db_name = chunk->GetValue(3, r).GetValue<string>();
-				pt.table_name = chunk->GetValue(4, r).GetValue<string>();
-				pt.rows_count = chunk->GetValue(5, r).GetValue<int64_t>();
-				pt.db_index = chunk->GetValue(6, r).GetValue<int32_t>();
-				pt.table_index = chunk->GetValue(7, r).GetValue<int32_t>();
-				info.physical_tables.push_back(std::move(pt));
-				pt_count++;
-			}
-		}
-
-		auto col_result = conn.Query("SELECT logic_db, logic_table, col_name, type_name, column_type, "
-		                             "is_nullable, col_precision, col_scale FROM table_columns");
-		if (!col_result->HasError()) {
-			while (true) {
-				auto chunk = col_result->Fetch();
-				if (!chunk || chunk->size() == 0) {
-					break;
-				}
-				for (idx_t r = 0; r < chunk->size(); r++) {
-					string logic_db = chunk->GetValue(0, r).GetValue<string>();
-					string logic_table = chunk->GetValue(1, r).GetValue<string>();
-
-					ColumnInfo col;
-					col.name = chunk->GetValue(2, r).GetValue<string>();
-					col.type_name = chunk->GetValue(3, r).GetValue<string>();
-					col.column_type = chunk->GetValue(4, r).GetValue<string>();
-					col.is_nullable = chunk->GetValue(5, r).GetValue<bool>();
-					col.precision = chunk->GetValue(6, r).GetValue<int64_t>();
-					col.scale = chunk->GetValue(7, r).GetValue<int64_t>();
-					schema_map[logic_db][logic_table].columns.push_back(std::move(col));
-					col_count++;
-				}
-			}
-		}
-
-		if (schema_map.empty()) {
-			return false;
-		}
-
-		auto elapsed =
-		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-		Printer::Print(StringUtil::Format(
-		    "[mysql_sharding] Cache loaded: %d schemas, %d physical tables, %d columns (%.1fs)",
-		    schema_map.size(), pt_count, col_count, elapsed / 1000.0));
-		return true;
-	} catch (...) {
-		return false;
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Catalog interface
 // ---------------------------------------------------------------------------
-
-const LogicTableInfo *ShardingCatalog::GetLogicTable(const string &schema, const string &table) const {
-	auto si = schema_map.find(schema);
-	if (si == schema_map.end()) {
-		return nullptr;
-	}
-	auto ti = si->second.find(table);
-	if (ti == si->second.end()) {
-		return nullptr;
-	}
-	return &ti->second;
-}
 
 optional_ptr<CatalogEntry> ShardingCatalog::CreateSchema(CatalogTransaction, CreateSchemaInfo &) {
 	throw BinderException("MySQL sharding catalog is read-only");
@@ -450,14 +472,15 @@ void ShardingCatalog::DropSchema(ClientContext &, DropInfo &) {
 }
 
 void ShardingCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
+	auto names = GetSchemaNames();
 	lock_guard<mutex> l(schema_lock);
-	for (auto &sp : schema_map) {
-		if (schema_entries.find(sp.first) == schema_entries.end()) {
+	for (auto &name : names) {
+		if (schema_entries.find(name) == schema_entries.end()) {
 			CreateSchemaInfo info;
-			info.schema = sp.first;
-			schema_entries[sp.first] = make_uniq<ShardingSchemaEntry>(*this, info);
+			info.schema = name;
+			schema_entries[name] = make_uniq<ShardingSchemaEntry>(*this, info);
 		}
-		callback(*schema_entries[sp.first]);
+		callback(*schema_entries[name]);
 	}
 }
 
@@ -465,17 +488,26 @@ optional_ptr<SchemaCatalogEntry> ShardingCatalog::LookupSchema(CatalogTransactio
                                                                 const EntryLookupInfo &schema_lookup,
                                                                 OnEntryNotFound if_not_found) {
 	auto schema_name = schema_lookup.GetEntryName();
+	auto all_schemas = GetSchemaNames();
+
 	if (schema_name == DEFAULT_SCHEMA) {
-		if (schema_map.empty()) {
+		if (all_schemas.empty()) {
 			if (if_not_found != OnEntryNotFound::RETURN_NULL) {
 				throw BinderException("No schemas available in MySQL sharding catalog");
 			}
 			return nullptr;
 		}
-		schema_name = schema_map.begin()->first;
+		schema_name = all_schemas[0];
 	}
 
-	if (schema_map.find(schema_name) == schema_map.end()) {
+	bool found = false;
+	for (auto &s : all_schemas) {
+		if (s == schema_name) {
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
 		if (if_not_found != OnEntryNotFound::RETURN_NULL) {
 			throw BinderException("Schema with name \"%s\" not found", schema_name);
 		}

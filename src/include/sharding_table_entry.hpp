@@ -9,7 +9,7 @@ namespace duckdb {
 class ShardingTableEntry : public TableCatalogEntry {
 public:
 	ShardingTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-	                   const LogicTableInfo &logic_table);
+	                   LogicTableInfo logic_table);
 
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
@@ -17,7 +17,7 @@ public:
 	void BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj, LogicalUpdate &update,
 	                           ClientContext &context) override;
 
-	const LogicTableInfo &logic_table_info;
+	LogicTableInfo logic_table_info;
 };
 
 } // namespace duckdb

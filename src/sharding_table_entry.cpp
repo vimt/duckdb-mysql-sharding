@@ -7,8 +7,8 @@
 namespace duckdb {
 
 ShardingTableEntry::ShardingTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-                                       const LogicTableInfo &logic_table)
-    : TableCatalogEntry(catalog, schema, info), logic_table_info(logic_table) {
+                                       LogicTableInfo logic_table)
+    : TableCatalogEntry(catalog, schema, info), logic_table_info(std::move(logic_table)) {
 }
 
 unique_ptr<BaseStatistics> ShardingTableEntry::GetStatistics(ClientContext &, column_t) {

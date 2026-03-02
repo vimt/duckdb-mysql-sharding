@@ -9,7 +9,7 @@ DuckDB 扩展，支持连接多个 MySQL 实例，自动发现分库分表并建
 - **透明查询路由**：查询逻辑表时，自动生成 UNION ALL 分发到各 host 的物理表，合并结果返回
 - **Filter & Projection Pushdown**：WHERE 条件和列投影下推到每个物理表查询，CTE 外层 WHERE 也能穿透下推
 - **懒加载列信息**：列定义按 schema 粒度懒加载，首次查询某 schema 时才从 MySQL 获取
-- **Schema 缓存**：使用 DuckDB 数据库文件缓存 schema 元数据，重启后秒级加载
+- **Schema 缓存**：使用 DuckDB 数据库文件作为 schema 元数据的唯一存储，增量读写，可直接用 DuckDB 打开查看
 - **缓存 TTL**：支持设置缓存过期时间，过期后自动从 MySQL 重新发现
 - **手动刷新**：通过 `CALL` 命令全量刷新或按 schema 刷新
 - **只读**：仅支持 SELECT，不支持写操作
@@ -61,7 +61,7 @@ ATTACH '/path/to/hosts.conf' AS rt (TYPE mysql_sharding);
 
 | 选项 | 说明 | 默认值 |
 |------|------|--------|
-| `CACHE_PATH` | 缓存文件路径 | 文件模式：`{file}.cache.duckdb`；字符串模式：不缓存 |
+| `CACHE_PATH` | 缓存文件路径（DuckDB 数据库文件） | 文件模式：`{file}.cache.duckdb`；字符串模式：内存（不持久化） |
 | `CACHE_TTL` | 缓存过期时间（秒），0 表示永不过期 | `0` |
 
 ```sql
@@ -115,26 +115,33 @@ USE_MERGED_VCPKG_MANIFEST=1 make release
 ## 架构
 
 ```
-ATTACH 'host=... ; host=...' AS cluster (TYPE mysql_sharding)
+ATTACH 'host=... ; host=...' AS cluster (TYPE mysql_sharding, CACHE_PATH '/tmp/cache.duckdb')
   │
   ├─ ShardingConfig::Parse()                 解析连接串（直接字符串或文件）
-  ├─ ShardingCatalog::LoadCache()            尝试从 DuckDB 缓存文件加载
-  │    └─ 命中 → 跳过 DiscoverSchemas，秒级就绪
-  ├─ ShardingCatalog::DiscoverSchemas()      连接各 host，查 information_schema.tables
-  │    ├─ Host1: SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_ROWS
-  │    └─ Host2: ...
-  ├─ SplitSharding("db_00000001")            拆分为 ("db", 1)
-  └─ 建立 schema_map: {logic_db -> {logic_table -> [PhysicalTableInfo...]}}
+  ├─ InitCacheDB()                           打开/创建 cache DuckDB（文件或 :memory:）
+  │    └─ CREATE TABLE IF NOT EXISTS physical_tables, table_columns, cache_meta
+  ├─ 检查 physical_tables 是否有数据 + TTL
+  │    ├─ 有数据且未过期 → 直接使用，秒级就绪
+  │    └─ 无数据或已过期 → DiscoverSchemas()
+  └─ DiscoverSchemas()                       连接各 host，写入 cache DB
+       ├─ DELETE FROM physical_tables
+       ├─ Host1: SELECT TABLE_SCHEMA, TABLE_NAME → INSERT INTO physical_tables
+       └─ Host2: ...
 
 SELECT * FROM cluster.my_db.my_table WHERE id = 1
   │
-  ├─ LookupSchema("my_db") → ShardingSchemaEntry
+  ├─ LookupSchema("my_db")                  查询 cache DB: SELECT DISTINCT logic_db
   ├─ EnsureTablesLoaded()
-  │    └─ 首次访问：LoadColumnsForSchema("my_db") 批量从 MySQL 加载列信息
+  │    ├─ HasColumnsForSchema("my_db")?      查询 cache DB: SELECT COUNT(*) FROM table_columns
+  │    ├─ 无 → LoadColumnsForSchema()        从 MySQL 加载 → INSERT INTO table_columns
+  │    └─ 有 → GetLogicTable()               直接从 cache DB 读取列定义和物理表列表
   ├─ GetScanFunction() → 内部 scan function
   └─ InitGlobalState()
        ├─ Projection pushdown: 只 SELECT 需要的列
        ├─ Filter pushdown: WHERE id=1 下推（支持穿透 CTE）
        ├─ 按 host 分组物理表，生成 UNION ALL 查询
        └─ Scan(): 依次连接各 host 执行，流式返回结果
+
+缓存文件可直接用 DuckDB 打开查看:
+  duckdb /tmp/cache.duckdb -c "SELECT * FROM physical_tables LIMIT 10"
 ```
