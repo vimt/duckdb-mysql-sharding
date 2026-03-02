@@ -1,0 +1,10 @@
+{
+  "dependencies": [
+    "libmariadb"
+  ],
+  "vcpkg-configuration": {
+    "overlay-ports": [
+      "./vcpkg_ports"
+    ]
+  }
+}
