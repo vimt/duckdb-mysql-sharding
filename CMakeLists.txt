@@ -3,7 +3,7 @@ set(TARGET_NAME mysql_sharding)
 project(${TARGET_NAME})
 
 # Reference duckdb-mysql for MySQL connection code and build infrastructure
-set(MYSQL_SCANNER_DIR ${CMAKE_CURRENT_LIST_DIR}/../duckdb-mysql)
+set(MYSQL_SCANNER_DIR ${CMAKE_CURRENT_LIST_DIR}/duckdb-mysql)
 
 set(libmariadb_DIR ${MYSQL_SCANNER_DIR}/vcpkg_ports/libmariadb)
 find_package(libmariadb REQUIRED)

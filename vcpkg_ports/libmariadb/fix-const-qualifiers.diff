@@ -1,0 +1,20 @@
+--- a/libmariadb/mariadb_lib.c
++++ b/libmariadb/mariadb_lib.c
+@@ -805,7 +805,7 @@
+     char *c;
+     
+     /* CONC-395: replace underscore "_" by dash "-" */
+-    while ((c= strchr(config_option, '_')))
++    while ((c= (char *)strchr(config_option, '_')))
+       *c= '-';
+ 
+     for (i=0; mariadb_defaults[i].conf_key; i++)
+@@ -1528,7 +1528,7 @@
+        stored in mysql->options.host */
+     host= NULL;
+   } else if (connection_handler ||
+-      (host && (end= strstr(host, "://"))))
++      (host && (end= (char *)strstr(host, "://"))))
+   {
+     MARIADB_CONNECTION_PLUGIN *plugin;
+     char plugin_name[64];

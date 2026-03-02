@@ -1,7 +1,4 @@
-build
-duckdb
-extension-ci-tools
-vcpkg_ports
+build/
 *.cache.duckdb
 *.cache.duckdb.wal
 AGENTS.md
