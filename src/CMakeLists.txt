@@ -14,6 +14,7 @@ set(MYSQL_SCANNER_SOURCES
 add_library(
   mysql_sharding_library OBJECT
   sharding_config.cpp
+  mysql_schema_manager.cpp
   sharding_catalog.cpp
   sharding_schema_entry.cpp
   sharding_table_entry.cpp

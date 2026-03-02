@@ -25,17 +25,17 @@ void ShardingSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 	}
 
 	auto &sharding_catalog = catalog.Cast<ShardingCatalog>();
+	auto &mgr = sharding_catalog.schema_mgr;
 
-	// Lazy load columns from MySQL if not yet in cache DB
-	if (!sharding_catalog.HasColumnsForSchema(name)) {
-		sharding_catalog.LoadColumnsForSchema(name);
+	if (!mgr.HasColumnsForSchema(name)) {
+		mgr.LoadColumnsForSchema(name);
 	}
 
 	MySQLTypeConfig type_config(context);
 
-	auto table_names = sharding_catalog.GetTableNames(name);
+	auto table_names = mgr.GetTableNames(name);
 	for (auto &table_name : table_names) {
-		auto logic_table = sharding_catalog.GetLogicTable(name, table_name);
+		auto logic_table = mgr.GetLogicTable(name, table_name);
 
 		if (logic_table.columns.empty()) {
 			continue;
