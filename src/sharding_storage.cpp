@@ -6,6 +6,7 @@
 #include "mysql_utils.hpp"
 
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 
 namespace duckdb {
@@ -13,8 +14,7 @@ namespace duckdb {
 static unique_ptr<Catalog> ShardingAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                            AttachedDatabase &db, const string &name, AttachInfo &info,
                                            AttachOptions &attach_options) {
-	auto &db_config = DBConfig::GetConfig(context);
-	if (!db_config.options.enable_external_access) {
+	if (!Settings::Get<EnableExternalAccessSetting>(context)) {
 		throw PermissionException("Attaching MySQL sharding databases is disabled through configuration");
 	}
 

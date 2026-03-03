@@ -101,7 +101,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 
-	config.storage_extensions["mysql_sharding"] = make_uniq<ShardingStorageExtension>();
+	StorageExtension::Register(config, "mysql_sharding", make_shared_ptr<ShardingStorageExtension>());
 
 	config.AddExtensionOption("mysql_sharding_debug_queries",
 	                          "Print all queries sent to MySQL sharding hosts to stdout", LogicalType::BOOLEAN,
