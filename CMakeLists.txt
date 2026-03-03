@@ -16,9 +16,14 @@ include_directories(${MYSQL_SCANNER_DIR}/src/include)
 
 add_subdirectory(src)
 
+build_static_extension(${TARGET_NAME} ${ALL_OBJECT_FILES})
+target_include_directories(${TARGET_NAME}_extension
+                           PRIVATE src/include ${MYSQL_INCLUDE_DIR}
+                                   ${MYSQL_SCANNER_DIR}/src/include)
+target_link_libraries(${TARGET_NAME}_extension ${MYSQL_LIBRARIES})
+
 set(PARAMETERS "-no-warnings")
 build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})
-
 target_include_directories(${TARGET_NAME}_loadable_extension
                            PRIVATE src/include ${MYSQL_INCLUDE_DIR}
                                    ${MYSQL_SCANNER_DIR}/src/include)
