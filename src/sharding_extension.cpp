@@ -1,4 +1,3 @@
-#define DUCKDB_BUILD_LOADABLE_EXTENSION
 #include "duckdb.hpp"
 
 #include "sharding_extension.hpp"
