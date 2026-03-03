@@ -22,6 +22,12 @@ target_include_directories(${TARGET_NAME}_extension
                                    ${MYSQL_SCANNER_DIR}/src/include)
 target_link_libraries(${TARGET_NAME}_extension ${MYSQL_LIBRARIES})
 
+install(
+  TARGETS ${TARGET_NAME}_extension
+  EXPORT "${DUCKDB_EXPORT_SET}"
+  LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+  ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
 set(PARAMETERS "-no-warnings")
 build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})
 target_include_directories(${TARGET_NAME}_loadable_extension
